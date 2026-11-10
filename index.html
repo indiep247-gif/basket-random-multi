@@ -26,8 +26,8 @@ function CallInterstitialAds() {}
 function CallRewardedAds() { c3_callFunction("onClose"); c3_callFunction("rewardedFailed"); }
 </script>
 
-<!-- Online multiplayer: PeerJS (WebRTC) + lobby/streaming layer -->
-<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.2/dist/peerjs.min.js"></script>
+<!-- Online multiplayer: Supabase Realtime (message relay) + input-sync layer -->
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
 <script src="multiplayer.js"></script>
 </head>
 <body>
