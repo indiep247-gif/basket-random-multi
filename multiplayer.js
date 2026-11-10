@@ -39,6 +39,9 @@
   var CODE = (qs.get('code') || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
   var ONLINE = (ROLE === 'host' || ROLE === 'join') && CODE.length === LEN;
   var MY = ROLE === 'host' ? 0 : 1; // my player index
+  var DEBUG = qs.get('debug') === '1';
+  var hist = {}, rngCalls = 0;
+  if (DEBUG) window.__mpHist = hist;
 
   var S = { status: 'idle', msg: '', gameLoaded: false, paired: false, ready: false, peerReady: false,
             started: false, rtt: null, desync: null, waiting: false, panel: false };
@@ -48,7 +51,7 @@
   var heldCb = null, HELD_ID = -7777;
   var frame = 0, D = 0, remoteUpTo = -1, peerAck = -1, seq = 0, lastSeqIn = 0;
   var outLog = [], evAt = {}, hashMine = {}, hashPeer = {}, hashOut = [];
-  var lastSend = 0, lastHeard = 0, rngLate = false;
+  var lastSend = 0, lastHeard = 0, rngLate = false, promised = -1, Dstart = 8, calm = 0;
 
   /* ---------------- helpers ---------------- */
   function getRt() {
@@ -97,7 +100,8 @@
       var rt = getRt();
       if (rt && rt.SetRandomNumberGeneratorCallback) {
         rngLate = !!rt._hasStarted;
-        rt.SetRandomNumberGeneratorCallback(mulberry32(fnv(CODE)));
+        var rng = mulberry32(fnv(CODE));
+        rt.SetRandomNumberGeneratorCallback(function () { rngCalls++; return rng(); });
         clearInterval(rngTimer);
         log('random seeded' + (rngLate ? ' (LATE)' : ''));
       }
@@ -144,7 +148,7 @@
   /* ---------------- local input -> scheduled events ---------------- */
   function addEvent(f, p, s, d) { (evAt[f] || (evAt[f] = [])).push({ p: p, s: s, d: d }); }
   function scheduleLocal(d) {
-    var f = frame + D, s = ++seq;
+    var f = Math.max(frame + D, promised + 1), s = ++seq;
     outLog.push([f, s, d]);
     addEvent(f, MY, s, d);
     sendSoon();
@@ -184,21 +188,31 @@
   }
 
   /* ---------------- the lockstep loop ---------------- */
+  // Objects that matter for gameplay. Backgrounds / tiles / UI stretch to fill the window, so their
+  // positions legitimately differ between two different window sizes and must not trigger a warning.
+  var HASH_INCLUDE = /(body|head|collision|shoe|short|tshirt|hair|ball|line|shadow|arm|leg|hand|physics)/i;
+  var HASH_EXCLUDE = /(tile|^ads_|font|portrait|^game_|bg$|title|pause|tutorial|trademark|button|more)/i;
+  function mixv(h, n) { h ^= (n | 0); return Math.imul(h, 16777619); }
   function stateHash() {
+    var total = 2166136261, per = {};
     try {
-      var rt = getRt(), h = 2166136261;
-      var mix = function (n) { h ^= (n | 0); h = Math.imul(h, 16777619); };
-      var cl = rt.GetAllObjectClasses();
+      var rt = getRt(), cl = rt.GetAllObjectClasses();
       for (var i = 0; i < cl.length; i++) {
-        var ins = cl[i].GetInstances ? cl[i].GetInstances() : [];
+        var c = 2166136261, ins = cl[i].GetInstances ? cl[i].GetInstances() : [];
+        c = mixv(c, ins.length);
         for (var j = 0; j < ins.length; j++) {
           var wi = ins[j].GetWorldInfo && ins[j].GetWorldInfo();
-          if (wi) { mix(Math.round(wi.GetX() * 10)); mix(Math.round(wi.GetY() * 10)); mix(Math.round(wi.GetAngle() * 1000)); }
+          if (wi) { c = mixv(c, Math.round(wi.GetX() * 10)); c = mixv(c, Math.round(wi.GetY() * 10)); c = mixv(c, Math.round(wi.GetAngle() * 1000)); }
         }
+        var nm = cl[i].GetName ? cl[i].GetName() : 'class' + i;
+        per[nm] = c >>> 0;
+        if (HASH_INCLUDE.test(nm) && !HASH_EXCLUDE.test(nm)) total = mixv(total, c);
       }
-      mix(Math.round(rt.GetGameTime() * 1000));
-      return h >>> 0;
-    } catch (e) { return 0; }
+      total = mixv(total, Math.round(rt.GetGameTime() * 1000));
+      total = mixv(total, rngCalls);
+    } catch (e) {}
+    per.__rngCalls = rngCalls;
+    return { h: total >>> 0, per: per };
   }
   function compareHash(f) {
     if (hashMine[f] != null && hashPeer[f] != null) {
@@ -214,7 +228,7 @@
   function stepOnce() {
     var f = frame;
     if (f > 0 && f % HASH_EVERY === 0) {
-      var h = stateHash(); hashMine[f] = h; hashOut.push([f, h]); compareHash(f);
+      var r = stateHash(), h = r.h; if (DEBUG) hist[f] = r.per; hashMine[f] = h; hashOut.push([f, h]); compareHash(f);
     }
     var evs = evAt[f];
     if (evs) {
@@ -227,7 +241,7 @@
     if (frame % SEND_EVERY === 0) sendPacket();
     cb((f + 1) * FRAME_MS);
   }
-  var lastNow = 0, acc = 0, blockedSince = 0;
+  var lastNow = 0, acc = 0, blockedSince = 0, winStart = 0, winTotal = 0, winBlocked = 0, lastLag = 0;
   function lockLoop(now) {
     realRAF(lockLoop);
     if (mode !== 'lock') { lastNow = now; return; }
@@ -240,6 +254,14 @@
     }
     if (acc > FRAME_MS * 4) acc = FRAME_MS * 4;
     var waiting = blocked && frame > remoteUpTo;
+    if (!winStart) winStart = now;
+    winTotal++; if (waiting) winBlocked++;
+    if (now - winStart >= 2000) {
+      S.stall = Math.round(100 * winBlocked / Math.max(1, winTotal));
+      if (S.stall > 10 && now - lastLag > 2000) { lastLag = now; send({ t: 'lag' }); }
+      if (S.stall === 0) { if (++calm >= 2 && D > Math.max(6, Dstart - 3)) { D--; calm = 0; } } else calm = 0;
+      winStart = now; winTotal = 0; winBlocked = 0;
+    }
     if (waiting) { if (!blockedSince) blockedSince = now; } else blockedSince = 0;
     var show = waiting && now - blockedSince > 400;
     if (show !== S.waiting) { S.waiting = show; var w = document.getElementById('mp-wait'); if (w) w.style.display = show ? 'block' : 'none'; }
@@ -248,7 +270,7 @@
 
   function startLock(d) {
     if (S.started) return;
-    S.started = true; D = d; frame = 0; remoteUpTo = d - 1; peerAck = -1;
+    S.started = true; D = d; Dstart = d; promised = d - 1; frame = 0; remoteUpTo = d - 1; peerAck = -1;
     mode = 'lock'; S.status = 'live'; lastHeard = Date.now();
     var rt = getRt(); if (rt) rt._lastTickTime = 0;
     log('start lockstep, delay', d, 'frames, player', MY + 1);
@@ -269,7 +291,8 @@
   }
   function sendPacket() {
     lastSend = Date.now();
-    var m = { t: 'in', u: frame + D - 1, a: remoteUpTo, e: outLog };
+    var u = Math.max(promised, frame + D - 1); promised = u;
+    var m = { t: 'in', u: u, a: remoteUpTo, e: outLog };
     if (hashOut.length) { m.h = hashOut; hashOut = []; }
     send(m);
   }
@@ -319,6 +342,7 @@
       if (m.n >= 0) samples.push(r);
     }
     else if (m.t === 'start') startLock(m.D);
+    else if (m.t === 'lag') { if (mode === 'lock' && D < 18) { D = Math.min(18, D + 2); calm = 0; log('raising delay to', D); } }
     else if (m.t === 'in') onIn(m);
     else if (m.t === 'bye') { if (mode === 'lock') releaseToFree('The other player left the game.'); else fail('The other player left.'); }
   }
@@ -336,7 +360,7 @@
   function finishBegin() {
     var s = samples.slice().sort(function (a, b) { return a - b; });
     var rtt = s.length ? s[Math.floor(s.length / 2)] : 150;
-    var d = Math.max(5, Math.min(24, Math.ceil(rtt / 2 / FRAME_MS) + SEND_EVERY + 2));
+    var d = Math.max(6, Math.min(18, Math.ceil(rtt / 2 / FRAME_MS) + SEND_EVERY + 3));
     for (var i = 0; i < 3; i++) setTimeout(function () { send({ t: 'start', D: d }); }, i * 120);
     startLock(d);
   }
@@ -445,7 +469,7 @@
     } else if (S.status === 'live') {
       back.style.display = 'none';
       h = '<div class="pill"><span>\u25CF Online \u00B7 You are Player ' + (MY + 1) + ' (W / \u2191 / Space)</span>' +
-        '<span class="small">' + (S.rtt != null ? Math.round(S.rtt) + ' ms \u00B7 ' : '') + 'delay ' + D + 'f \u00B7 ' +
+        '<span class="small">' + (S.rtt != null ? Math.round(S.rtt) + ' ms \u00B7 ' : '') + 'delay ' + D + 'f \u00B7 ' + (S.stall ? 'stalls ' + S.stall + '% \u00B7 ' : '') +
         (S.desync != null ? '<span class="bad">\u26A0 out of sync</span>' : '<span class="good">in sync</span>') + '</span>' +
         '<button data-act="leave" class="alt">Leave</button></div>';
     } else {
